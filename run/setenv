@@ -1,0 +1,11 @@
+module use /scratch/projects/compilers/modulefiles
+module list
+
+ml intel/24.1
+ml impi/21.12
+
+source /scratch/05231/aruhela/share/torchgpu/bin/activate
+
+
+which python
+
