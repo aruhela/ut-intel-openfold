@@ -11,7 +11,8 @@
 # Initialization
 SECONDS=0
 
-cd /scratch/05231/aruhela/ml/hpc/openfold/amit
+topdir=/scratch/05231/aruhela/ml/ut-intel-openfold/run
+cd $topdir
 
 module reset
 module use /scratch/projects/compilers/modulefiles
@@ -54,7 +55,7 @@ conda list
 env | grep SLURM
 
 datadir=/scratch/05231/aruhela/ml/dataset/openfold
-outdir="/scratch/05231/aruhela/ml/hpc/openfold/amit/output-$SLURM_JOB_ID"
+outdir="$topdir/output-$SLURM_JOB_ID"
 
 # Print current datetime:
 echo "started at `date`"
