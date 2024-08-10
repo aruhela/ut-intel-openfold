@@ -15,9 +15,9 @@
 from typing import Dict, List, Optional
 
 import torch
-import intel_extension_for_pytorch
-import oneccl_bindings_for_pytorch
-import torch.nn.parallel
+# import intel_extension_for_pytorch
+# import oneccl_bindings_for_pytorch
+# import torch.nn.parallel
 
 def dist_reduce_losses_avg(
     losses: Dict[str, torch.Tensor],

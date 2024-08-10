@@ -437,7 +437,7 @@ class AlphaFoldConfig:
         else:
             raise ValueError(f"unknown stage={repr(stage)}")
 
-        if precision in {"fp32", "tf32", "bf16"}:
+        if precision in {"fp64", "bf32", "fp32", "tf32", "bf16"}:
             pass
         elif precision in {"amp", "fp16"}:
             _update(cfg, _half_precision_settings())

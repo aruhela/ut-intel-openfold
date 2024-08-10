@@ -18,6 +18,7 @@ import hashlib
 import io
 import os
 import time
+import datetime
 from pathlib import Path
 from typing import List, Union, Dict,  Optional
 
@@ -28,7 +29,6 @@ import torch
 import intel_extension_for_pytorch as ipex
 import oneccl_bindings_for_pytorch
 import torch.nn.parallel
-
 
 from mlperf_common.frameworks.pyt import PyTCommunicationHandler
 from mlperf_common.logging import MLLoggerWrapper
@@ -53,7 +53,6 @@ from openfold.samplers import InitialTrainingSampler, ValidationSampler
 from openfold.swa import AlphaFoldSWA
 from openfold.torch_utils import disable_tf32, enable_tf32, map_tensor_tree
 from openfold.validation_metrics import compute_validation_metrics
-
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
@@ -126,7 +125,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--precision",
-        choices=["fp32", "fp64", "tf32", "bf16", "fp16", "amp"],
+        choices=["fp32", "fp64", "bf32", "tf32", "bf16", "fp16", "amp"],
         default="tf32",
         help="Numerical precision.",
     )
@@ -324,6 +323,7 @@ def initialize_parameters_from_checkpoint(
         "alphafold_state_dict" in init_checkpoint
         and "optimizer_state_dict" in init_checkpoint
     )
+    print("\nIn initialize_parameters_from_checkpoint\n")
     if is_resumable_checkpoint:
         init_alphafold_state_dict = init_checkpoint["alphafold_state_dict"]
         init_optimizer_state_dict = init_checkpoint["optimizer_state_dict"]
@@ -355,8 +355,10 @@ def validation(
     alphafold: Union[AlphaFold, AlphaFoldSWA],
     validation_dataloader: ValidationDataloader,
     device: torch.device,
+    dtype: torch.dtype,
 ) -> List[dict]:
     alphafold.eval()
+    # alphafold = ipex.optimize(alphafold, dtype=dtype)
     val_metrics_list = []
     val_batch_iterator = iter(validation_dataloader)
     for _ in range(len(validation_dataloader)):
@@ -481,17 +483,6 @@ def training(args: argparse.Namespace) -> None:
     # Set device:
     torch.xpu.set_device(device=device)
 
-    # Numerical precision settings:
-    if args.precision == "fp32":
-        disable_tf32()
-    elif args.precision == "tf32":
-        enable_tf32()
-    elif args.precision in {"bf16", "fp16", "amp"}:
-        raise NotImplementedError(f"precision={repr(args.precision)}")
-    else:
-        raise ValueError(f"unknown precision={repr(args.precision)}")
-    mllogger.event(key="precision", value=args.precision)
-
     # Get alphafold config:
     alphafold_config = AlphaFoldConfig.from_preset(
         stage="initial_training",
@@ -556,6 +547,41 @@ def training(args: argparse.Namespace) -> None:
         amsgrad=alphafold_config.optimizer_adam_amsgrad,
     )
     
+    # Ipex options
+    # weights_prepack=False level="O1",
+    ipex.enable_auto_channels_last()
+    ptype = torch.float32
+    if args.precision == "bf16":
+       ptype = torch.bfloat16
+       alphafold, optimizer = ipex.optimize(alphafold, optimizer=optimizer, dtype=torch.float16, inplace=True) # Float 16 Not supported
+    elif args.precision == "amp":
+        ptype = torch.bfloat16
+        # torch.xpu.amp.autocast(enabled=True, dtype=torch.bfloat16)
+        torch.xpu.amp.autocast(enabled=True)
+        alphafold, optimizer = ipex.optimize(alphafold, optimizer=optimizer, inplace=True) # Not supported
+    elif args.precision == "bf32":
+       torch.xpu.amp.autocast(enabled=True)
+       ipex.set_fp32_math_mode(mode=ipex.FP32MathMode.BF32, device="xpu")
+       alphafold, optimizer = ipex.optimize(alphafold, optimizer=optimizer, inplace=True,auto_kernel_selection=True, )
+    elif args.precision == "fp32":
+       ipex.set_fp32_math_mode(mode=ipex.FP32MathMode.FP32, device="xpu")
+       alphafold, optimizer = ipex.optimize(alphafold, optimizer=optimizer, inplace=True,auto_kernel_selection=True, )
+    elif args.precision == "tf32":
+       ipex.set_fp32_math_mode(mode=ipex.FP32MathMode.TF32, device="xpu")
+       alphafold, optimizer = ipex.optimize(alphafold, optimizer=optimizer, inplace=True,auto_kernel_selection=True, )
+    elif args.precision == "fp64":
+       ptype = torch.float64
+       alphafold, optimizer = ipex.optimize(alphafold, optimizer=optimizer, dtype=torch.float64, inplace=True)
+    else:
+        raise ValueError(f"unknown precision={repr(args.precision)}")
+
+    if is_main_process:
+        print("current fpmath_mode setting",ipex.get_fp32_math_mode(device="xpu"))
+
+    if is_main_process:
+        print("\nargs.precision=",args.precision," Precision set to ",ptype,"\n")
+    mllogger.event(key="precision", value=args.precision)
+
     mllogger.event(key=mllogger.constants.OPT_NAME, value="Adam")
     mllogger.event(key=mllogger.constants.OPT_BASE_LR, value=args.base_lr)
     mllogger.event(
@@ -748,12 +774,18 @@ def training(args: argparse.Namespace) -> None:
     )
 
     # Training loop:
-    #alphafold, optimizer = ipex.optimize(alphafold, optimizer=optimizer)
-    #alphafold = ipex.optimize(alphafold, optimizer=optimizer)
-
+    #++++++++++++++++++++++++++++++++++++++++++++++
+    start_time=time.time()
+    previous_time=start_time
+    epoch_num=0
+    iteration=1
     for iteration in range(1, args.num_train_iters + 1):
         if is_main_process:
-            print("iteration is ",iteration)
+            current_time=time.time()
+            elapsed_time = (current_time - start_time)
+            elapsed_time_diff = (current_time - previous_time)
+            previous_time=current_time
+            print("\niteration=",iteration, ", Time(s)=", format(elapsed_time, '.2f'), "diff(s)=",format(elapsed_time_diff, '.2f')," epoch_num=",epoch_num, ", system time is ",datetime.datetime.now())
         # Train-val cycle:
         train_val_cycle_i = (iteration - 1) // args.val_every_iters + 1
         is_train_val_cycle_start = bool((iteration - 1) % args.val_every_iters == 0)
@@ -805,7 +837,6 @@ def training(args: argparse.Namespace) -> None:
                     parameters=alphafold.parameters(),
                     max_norm=alphafold_config.clip_grad_max_norm,
                 )
-
             # LR scheduler update:
             lr_scheduler(iteration)
 
@@ -814,6 +845,7 @@ def training(args: argparse.Namespace) -> None:
 
             # SWA update:
             if swa_alphafold.enabled:
+                # print("swa_alphafold.enabled\n")
                 swa_alphafold.update(alphafold)
 
         # Average losses from distributed training:
@@ -824,7 +856,7 @@ def training(args: argparse.Namespace) -> None:
                     is_main_process=is_main_process,
                     main_rank=main_rank,
                     device=device,
-                    synchronize=True,
+                    synchronize=False,
                 )
             else:
                 losses_avg = losses
@@ -897,65 +929,73 @@ def training(args: argparse.Namespace) -> None:
                 alphafold=swa_alphafold if swa_alphafold.enabled else alphafold,
                 validation_dataloader=validation_dataloader,
                 device=device,
+                dtype=ptype,
             )
-            # if args.distributed:
-                # if(rank==0):
+            if args.distributed:
                 # Collect per-sample validation metrics to main process:
-                # val_metrics_list = dist_gather_val_metrics(
-                    # val_metrics_list=val_metrics_list,
-                    # val_pdb_chain_ids=validation_dataset.pdb_chain_ids,
-                    # is_main_process=is_main_process,
-                    # main_rank=main_rank,
-                    # world_size=world_size,
-                    # device=device,
-                    # synchronize=True,
-                # )
-            # perf_validation += time.perf_counter()
-            # if is_main_process:
+                val_metrics_list = dist_gather_val_metrics(
+                    val_metrics_list=val_metrics_list,
+                    val_pdb_chain_ids=validation_dataset.pdb_chain_ids,
+                    is_main_process=is_main_process,
+                    main_rank=main_rank,
+                    world_size=world_size,
+                    device=device,
+                    synchronize=True,
+                )
+            perf_validation += time.perf_counter()
+            if is_main_process:
                 # Compute aggregated validation metrics in main process:
-                # val_metrics_df = pd.DataFrame(val_metrics_list)
-                # val_avg_lddt_ca = float(val_metrics_df["lddt_ca"].mean())
-                # val_size = len(val_metrics_list)
-                # assert val_size == len(validation_dataset)
-                # val_throughput = val_size / perf_validation
-                # mllogger.event(
-                    # key="eval_accuracy",
-                    # value=val_avg_lddt_ca,
-                    # metadata={"epoch_num": epoch_num, "instance": mlperf_instance},
-                # )
-            # if is_main_process_and_logging:
+                val_metrics_df = pd.DataFrame(val_metrics_list)
+                val_avg_lddt_ca = float(val_metrics_df["lddt_ca"].mean())
+                val_size = len(val_metrics_list)
+                assert val_size == len(validation_dataset)
+                val_throughput = val_size / perf_validation
+                print("eval_accuracy=",val_avg_lddt_ca,
+                      " epoch_num=",epoch_num,
+                      " duration=",perf_validation,
+                      " val_size=",val_size,
+                      " throughput=",val_throughput)
+                mllogger.event(
+                    key="eval_accuracy",
+                    value=val_avg_lddt_ca,
+                    metadata={"epoch_num": epoch_num, "instance": mlperf_instance},
+                )
+            if is_main_process_and_logging:
                 # Save validation logs:
-                # val_log = {
-                    # "iteration": iteration,
-                    # "avg_lddt_ca": val_avg_lddt_ca,
-                    # "timestamp": get_timestamp_string(),
-                    # "duration": perf_validation,
-                    # "size": val_size,
-                    # "throughput": val_throughput,
-                # }
-                # print(f"validation {val_log}")
-                # val_log["metrics_list"] = val_metrics_list
-                # save_logs([val_log], val_logs_outpath, append=True)
+                val_log = {
+                    "iteration": iteration,
+                    "avg_lddt_ca": val_avg_lddt_ca,
+                    "timestamp": get_timestamp_string(),
+                    "duration": perf_validation,
+                    "size": val_size,
+                    "throughput": val_throughput,
+                }
+                print(f"validation {val_log}")
+                val_log["metrics_list"] = val_metrics_list
+                save_logs([val_log], val_logs_outpath, append=True)
             # Check if validation reaches target accuracy:
-            # if is_main_process:
-                # if val_avg_lddt_ca >= args.target_avg_lddt_ca_value:
-                    # stop_training_flag = torch.ones(1, device=device)
-                # else:
-                    # stop_training_flag = torch.zeros(1, device=device)
-            # else:
-                # stop_training_flag = torch.zeros(1, device=device)
-            # if args.distributed:
-                # torch.distributed.broadcast(tensor=stop_training_flag, src=main_rank)
+            if is_main_process:
+                if val_avg_lddt_ca >= args.target_avg_lddt_ca_value:
+                    stop_training_flag = torch.ones(1, device=device)
+                else:
+                    stop_training_flag = torch.zeros(1, device=device)
+            else:
+                stop_training_flag = torch.zeros(1, device=device)
+            if args.distributed:
+                torch.distributed.broadcast(tensor=stop_training_flag, src=main_rank)
             # Preventively clear the cache created during validation:
             gc.collect()
+            # torch.cuda.empty_cache()
             torch.xpu.empty_cache()
-            torch.cuda.empty_cache()
+            if is_main_process:
+                print("torch.xpu.empty_cache...")
             # End MLPerf evaluation measurement:
             mllogger.end(
                 key=mllogger.constants.EVAL_STOP,
                 sync=False,
                 metadata={"epoch_num": epoch_num, "instance": mlperf_instance},
             )
+
         # Save checkpoint:
         if (
             is_main_process
@@ -978,8 +1018,8 @@ def training(args: argparse.Namespace) -> None:
             )
 
         # Stop training if reached target validation metric:
-        # if is_validation and stop_training_flag:
-            # break
+        if is_validation and stop_training_flag:
+            break
 
     # Synchronize before return:
     if args.distributed:
@@ -987,6 +1027,12 @@ def training(args: argparse.Namespace) -> None:
 
     # Log the end of the training loop:
     mllogger.log_run_stop(status=mllogger.constants.SUCCESS)
+    current_time=time.time()
+    elapsed_time = (current_time - start_time)
+    elapsed_time_diff = (current_time - previous_time)
+    previous_time=current_time
+    if is_main_process:
+        print("\niteration=",iteration, ", Time(s)=", format(elapsed_time, '.2f'), "diff(s)=",format(elapsed_time_diff, '.2f')," epoch_num=",epoch_num, ", system time is ",datetime.datetime.now())
 
 
 if __name__ == "__main__":

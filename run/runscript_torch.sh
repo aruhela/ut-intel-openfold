@@ -1,17 +1,18 @@
 #!/bin/bash
 #SBATCH --job-name mlperf-hpc-openfold
 #SBATCH --output=slurm-%j.txt
-#SBATCH -N 2
-#SBATCH --ntasks-per-node 1
-#SBATCH --cpus-per-task 12
-#SBATCH -p systest-pvc
-#SBATCH --time=6:00:00
-##SBATCH --reservation=mlcommons
+#SBATCH -N 1
+#SBATCH --ntasks-per-node 8
+#SBATCH -p pvc
+#SBATCH --time=2:00:00
+#SBATCH -A ASC24012
 
 # Initialization
+echo -e "`date` : ----- Started -------"
 SECONDS=0
 
-topdir=/scratch/05231/aruhela/ml/ut-intel-openfold/run
+#topdir=/scratch/05231/aruhela/ml/ut-intel-openfold/run
+topdir=$PWD
 cd $topdir
 
 module reset
@@ -19,13 +20,13 @@ module use /scratch/projects/compilers/modulefiles
 source /scratch/05231/aruhela/share/torchgpu/bin/activate
 source $MKLROOT/env/vars.sh
 
-export TF_FORCE_UNIFIED_MEMORY=1
-export XLA_PYTHON_CLIENT_PREALLOCATE=true
-export XLA_PYTHON_CLIENT_MEM_FRACTION="0.1"
-export XLA_PYTHON_CLIENT_ALLOCATOR="platform"
+# export TF_FORCE_UNIFIED_MEMORY=1
+# export XLA_PYTHON_CLIENT_PREALLOCATE=true
+# export XLA_PYTHON_CLIENT_MEM_FRACTION="0.1"
+# export XLA_PYTHON_CLIENT_ALLOCATOR="platform"
 
-export ZE_FLAT_DEVICE_HIERARCHY=FLAT
-export ZE_AFFINITY_MASK=0,2,4,6,1,3,5,7
+# export ZE_FLAT_DEVICE_HIERARCHY=FLAT
+#export ZE_AFFINITY_MASK=0,2,4,6,1,3,5,7
 
 #export ZE_FLAT_DEVICE_HIERARCHY=COMPOSITE 
 
@@ -41,18 +42,18 @@ export ZE_AFFINITY_MASK=0,2,4,6,1,3,5,7
 #export CCL_ATL_TRANSPORT=mpi
 
 #export I_MPI_HBW_POLICY=hbw_bind
-export I_MPI_HBW_POLICY=hbw_preferred
+#export I_MPI_HBW_POLICY=hbw_preferred
 
 #export TACC_IBRUN_DEBUG=1
 #export I_MPI_DEBUG=4
 #export MLIR_ENABLE_DUMP=1
-env | grep "TORCH\|CCL\CCL\I_MPI"
+# env | grep "TORCH\|CCL\CCL\I_MPI"
 
-which python3 
-python -m torch.utils.collect_env
-python -c 'import torch ; print(torch.__version__)'
-conda list
-env | grep SLURM
+# which python3 
+# python -m torch.utils.collect_env
+# python -c 'import torch ; print(torch.__version__)'
+# conda list
+# env | grep SLURM
 
 datadir=/scratch/05231/aruhela/ml/dataset/openfold
 outdir="$topdir/output-$SLURM_JOB_ID"
@@ -62,16 +63,19 @@ echo "started at `date`"
 echo "START" $(date +"%Y-%m-%d %H:%M:%S")
 
 # Print node list:
-echo "SLURM_JOB_ID=$SLURM_JOB_ID"
-echo "SLURM_JOB_NUM_NODES=$SLURM_JOB_NUM_NODES"
-echo "SLURM_NODELIST=$SLURM_NODELIST"
+# echo "SLURM_JOB_ID=$SLURM_JOB_ID"
+# echo "SLURM_JOB_NUM_NODES=$SLURM_JOB_NUM_NODES"
+# echo "SLURM_NODELIST=$SLURM_NODELIST"
 
 # Print current datetime again:
 echo "READY" $(date +"%Y-%m-%d %H:%M:%S")
 
 # Set number of threads to use for parallel regions:
-#export OMP_NUM_THREADS=1
-unset OMP_NUM_THREADS
+export OMP_NUM_THREADS=8
+export MKL_NUM_THREADS=8
+#unset OMP_NUM_THREADS
+echo "OMP_NUM_THREADS=$OMP_NUM_THREADS"
+echo "MKL_NUM_THREADS=$MKL_NUM_THREADS"
 
 # Set MLPerf variables:
 export DATESTAMP=$(date +"%y%m%d%H%M%S%N")
@@ -97,7 +101,8 @@ echo "MASTER_ADDR=$MASTER_ADDR"
 echo "MASTER_PORT=$MASTER_PORT"
 export MY_MPIRUN_OPTIONS="-env MASTER_ADDR=$MASTER_ADDR -env MASTER_PORT=$MASTER_PORT "
 
-RANDOM=$(date +%s)
+# RANDOM=$(date +%s)
+RANDOM=9971
 echo "RANDOM=$RANDOM"
 
 echo "Kill Python"
@@ -106,6 +111,8 @@ echo "kill Torchrun"
 
 set -x
 ./intel-smi
+
+# export ONEDNN_VERBOSE=1
 
 export TORCH_RUN=1
 /usr/bin/time -f "real \t%e (seconds)" \
@@ -124,22 +131,22 @@ torchrun \
 --pdb_alignments_dirpath $datadir/pdb_data/open_protein_set/processed/pdb_alignments \
 --initialize_parameters_from $datadir/mlperf_hpc_openfold_resumable_checkpoint_b518be46.pt \
 --seed $RANDOM \
---num_train_iters 10 \
---val_every_iters 40  \
+--num_train_iters 40 \
+--val_every_iters 60  \
 --local_batch_size 1 \
 --base_lr 1e-3 \
 --warmup_lr_init 1e-5 \
---warmup_lr_iters 2 \
+--warmup_lr_iters 0 \
 --distributed \
---num_train_dataloader_workers 16 \
+--num_train_dataloader_workers 8 \
 --num_val_dataloader_workers 4 \
---log_every_iters 1 \
---gradient_accumulation_iters 1 
+--log_every_iters 2 \
+--gradient_accumulation_iters 2 \
+--precision "tf32" \
 
+# Precision choices=["bf16", "fp16", "bf32", "fp32", "fp64","tf32" "amp"],
 set +x
-
-#--mpi=none \
-#--precision tf32 \
 
 srun -n $SLURM_NNODES pkill python
 echo -e "`date` : ----- FINISHED $me in $SECONDS Seconds-------"
+
